@@ -87,10 +87,17 @@ class SeedVR2ImageSpaceMultiplierBridge:
         image_latent = samples["samples"]
         if getattr(image_latent, "is_nested", False):
             image_latent = image_latent.unbind()[0]
-        if image_latent.ndim != 4:
+        if image_latent.ndim not in (4, 5):
             raise ValueError(
-                "Expected a 4-D image latent [B,C,H,W], "
+                "Expected a 4-D image latent [B,C,H,W] or a 5-D single-frame/video latent "
+                "[B,C,T,H,W], "
                 f"but received shape {tuple(image_latent.shape)}."
+            )
+        if image_latent.ndim == 5 and image_latent.shape[2] != 1:
+            raise ValueError(
+                "This bridge accepts only a single image/frame, but the input latent has "
+                f"{image_latent.shape[2]} frames (shape {tuple(image_latent.shape)}). "
+                "Provide a single-frame latent."
             )
 
         factor = float(multiplier)
@@ -100,8 +107,13 @@ class SeedVR2ImageSpaceMultiplierBridge:
             raise ValueError(f"Unsupported scaling_method: {scaling_method}.")
 
         # Decode the image latent to ComfyUI IMAGE [B,H,W,C].
+        # Pass through the latent's native rank: some image workflows use 4-D
+        # [B,C,H,W] latents, while SeedVR2-compatible workflows use 5-D
+        # [B,C,T,H,W] latents even when T=1.
         image = image_vae.decode(image_latent)
         if image.ndim == 5:
+            # ComfyUI video IMAGE tensors are [B,T,H,W,C]; flatten batch and
+            # time into the image batch, preserving H/W/C.
             image = image.reshape(-1, image.shape[-3], image.shape[-2], image.shape[-1])
         if image.ndim != 4 or image.shape[-1] < 3:
             raise ValueError(
