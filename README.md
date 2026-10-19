@@ -26,4 +26,5 @@ This means a 1440p image at `1.5×` is resized to approximately 2160p **before**
 ## Install
 Stop ComfyUI, back up and remove the previous bridge folder so ComfyUI does not load two copies of the node. Extract this archive into `ComfyUI/custom_nodes/`, creating `seedvr2_image_space_multiplier_bridge`, then restart ComfyUI.
 
-Proposed solution going forward: Do so entirely in latent space, but this will require training. This is a stopgap solution that still relies on upscaling in pixel space.
+This is a stopgap solution that still relies on upscaling in pixel space. 
+Proposed solution going forward: Do so entirely in latent space, but this will require training. 
