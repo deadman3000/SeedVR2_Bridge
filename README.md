@@ -1,30 +1,28 @@
 # SeedVR2 Image-Space Multiplier Bridge
 
-This ComfyUI custom node decodes an image latent with its associated image VAE, applies the multiplier in pixel space, then encodes the result with the SeedVR2 VAE.
+A ComfyUI node that decodes a source image latent with `image_vae`, resizes the decoded pixels in image space, and re-encodes them with `seedvr2_vae` for the SeedVR2 refinement path.
 
 ## Inputs
-- `samples`: image `LATENT` from a compatible sampler
-- `image_vae`: VAE associated with the input image latent
-- `seedvr2_vae`: SeedVR2 VAE
-- `multiplier`: image-space scale factor, default `1.0`, range `1.0`–`4.0`, step `0.1`
-- `scaling_method`: `bilinear` (default), `bicubic`, `lanczos`, `nearest`, `nearest-exact`, or `area`
 
-## What changed
-1. Decode the input image latent using `image_vae`.
-2. If `multiplier` is above `1.0`, resize the decoded image pixels internally.
-3. Encode that resized image using the SeedVR2 VAE.
-4. Return the SeedVR2 latent without any post-encode latent interpolation.
+- `samples`: source `LATENT` (4-D image latent or 5-D single-frame latent with T=1)
+- `image_vae`: VAE used to decode the source latent
+- `seedvr2_vae`: SeedVR2 VAE used to encode the resized image
+- `multiplier`: image-space scale multiplier (default 1.0)
+- `scaling_method`: resize method (default Lanczos)
+- `short_side`: optional base short-side resolution in pixels (default 0, which uses the decoded image's current short side)
 
-This means a 1440p image at `1.5×` is resized to approximately 2160p **before** SeedVR2 encoding. The target width and height are rounded to the nearest multiple of 8 pixels for VAE compatibility. For example, 2560×1440 becomes 3840×2160.
+The original widgets remain in their original order (`multiplier`, then `scaling_method`). The new `short_side` widget is appended after them to preserve saved workflow widget values when updating the node.
 
-## Workflow notes
-- Keep the SeedVR2 conditioning node connected to the bridge's `seedvr2_latent` output as in the existing working workflow.
-- Set `multiplier=1.0` to preserve the original no-resize bridge path.
-- The interpolation mode now applies to decoded image pixels, not latent feature maps.
-- This archive has been syntax-checked and tested with mock VAEs for expected dimensions, but it has not been executed inside the user's ComfyUI installation. Back up the existing node folder before replacing it.
+Output `seedvr2_latent` connects to the SeedVR2 sampler/refinement path. Connect `output_resolution` to a Show Text node if you want to display the calculated output dimensions.
 
-## Install
-Stop ComfyUI, back up and remove the previous bridge folder so ComfyUI does not load two copies of the node. Extract this archive into `ComfyUI/custom_nodes/`, creating `seedvr2_image_space_multiplier_bridge`, then restart ComfyUI.
+Output dimensions are calculated from the decoded image aspect ratio, scaled by `short_side × multiplier` (or by the decoded image's own short side when `short_side=0`), then rounded to the nearest multiple of 16.
 
-This is a stopgap solution that still relies on upscaling in pixel space. 
-Proposed solution going forward: Do so entirely in latent space, but this will require training. 
+Example: source image 3392×1440, `short_side=1440`, `multiplier=1.2` → `4064 × 1728`.
+
+
+New: added a manual short side field that is automatically multiplied. 0 sets to default behaviour based upon input latent. 
+Added report output to view the final resolution.
+ 
+### Existing workflow compatibility (v12)
+
+This version includes a small ComfyUI frontend migration that repairs an invalid/missing `short_side` value to `0` when an older saved workflow is loaded. It also repairs an invalid `multiplier` value to `1.0`. Valid saved values are left unchanged. The original widget order remains `multiplier`, `scaling_method`, then `short_side`.
