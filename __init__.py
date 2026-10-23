@@ -1,9 +1,9 @@
 """SeedVR2 image-space multiplier bridge for ComfyUI.
 
-Decode an image latent with its image VAE, optionally resize the decoded IMAGE,
-then encode that image with the SeedVR2 VAE. The multiplier therefore changes
-the image resolution *before* SeedVR2 encoding; it does not interpolate an
-already-encoded SeedVR2 latent.
+Decode a source image latent, resize the decoded pixels in image space, then
+encode with the SeedVR2 VAE. A user-entered short-side value sets the base
+short-side resolution; the multiplier scales it. The long side is calculated
+from the decoded image aspect ratio, and both dimensions are aligned to 16 px.
 """
 
 import torch
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 class SeedVR2ImageSpaceMultiplierBridge:
     SCALE_METHODS = ["bilinear", "bicubic", "lanczos", "nearest", "nearest-exact", "area"]
+    PIXEL_ALIGNMENT = 16
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -20,6 +21,7 @@ class SeedVR2ImageSpaceMultiplierBridge:
                 "samples": ("LATENT",),
                 "image_vae": ("VAE",),
                 "seedvr2_vae": ("VAE",),
+                # Keep the original widget order intact for saved workflow compatibility.
                 "multiplier": ("FLOAT", {
                     "default": 1.0,
                     "min": 1.0,
@@ -27,36 +29,60 @@ class SeedVR2ImageSpaceMultiplierBridge:
                     "step": 0.1,
                     "round": 0.1,
                 }),
-                "scaling_method": (cls.SCALE_METHODS, {"default": "bilinear"}),
+                "scaling_method": (cls.SCALE_METHODS, {"default": "lanczos"}),
+                # New widget goes last so existing saved widget values keep their positions.
+                "short_side": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 16384,
+                    "step": 16,
+                    "display": "number",
+                    "tooltip": "Base short-side size in pixels. Set to 0 to use the decoded image's current short side.",
+                }),
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("seedvr2_latent",)
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("seedvr2_latent", "output_resolution")
     FUNCTION = "convert"
     CATEGORY = "latent/SeedVR2"
     DESCRIPTION = (
-        "Decodes the image latent, optionally resizes the decoded image, then encodes "
-        "at that target resolution with the SeedVR2 VAE. Scaling occurs in image space "
-        "before SeedVR2 encoding, not by interpolating the SeedVR2 latent."
+        "Decodes the source latent, resizes pixels using short_side × multiplier while "
+        "preserving aspect ratio, aligns dimensions to 16 pixels, and encodes with the "
+        "SeedVR2 VAE. The output_resolution string can be connected to a Show Text node. "
+        "Set short_side to 0 to use the decoded image's original short side."
     )
 
-    @staticmethod
-    def _target_dimension(value, factor, alignment=8):
-        """Scale a pixel dimension and round to the nearest VAE-friendly multiple of 8."""
-        scaled = max(alignment, int(round((value * factor) / alignment)) * alignment)
-        return scaled
+    @classmethod
+    def _target_dimension(cls, value, alignment=None):
+        """Round a pixel dimension to the nearest aligned size."""
+        if alignment is None:
+            alignment = cls.PIXEL_ALIGNMENT
+        return max(alignment, int(round(value / alignment)) * alignment)
+
+    @classmethod
+    def _target_size(cls, height, width, short_side, multiplier):
+        """Calculate aligned output dimensions from short side and aspect ratio."""
+        actual_short = min(height, width)
+        actual_long = max(height, width)
+        base_short = actual_short if int(short_side) == 0 else int(short_side)
+        target_short = base_short * float(multiplier)
+        target_long = target_short * (actual_long / actual_short)
+
+        short_dim = cls._target_dimension(target_short)
+        long_dim = cls._target_dimension(target_long)
+        if height <= width:
+            return short_dim, long_dim
+        return long_dim, short_dim
 
     @staticmethod
     def _resize_image(image, target_h, target_w, method):
         # ComfyUI IMAGE layout is [B,H,W,C]. Interpolate in channel-first layout.
         original_dtype = image.dtype
         nchw = image[..., :3].permute(0, 3, 1, 2)
-        # Keep interpolation stable for half/bfloat16 image tensors, then restore dtype.
         work = nchw.float() if nchw.dtype in (torch.float16, torch.bfloat16) else nchw
 
         if method == "lanczos":
-            # Separable Lanczos-3 resize, applied to image pixels rather than latent features.
             def lanczos_weights(input_size, output_size, device):
                 scale = input_size / output_size
                 filter_scale = max(scale, 1.0)
@@ -80,41 +106,40 @@ class SeedVR2ImageSpaceMultiplierBridge:
 
         return resized.to(original_dtype).permute(0, 2, 3, 1).contiguous()
 
-    def convert(self, samples, image_vae, seedvr2_vae, multiplier=1.0, scaling_method="bilinear"):
+    def convert(self, samples, image_vae, seedvr2_vae, multiplier=1.0, scaling_method="lanczos", short_side=0):
         if not isinstance(samples, dict) or "samples" not in samples:
             raise ValueError("Input must be a ComfyUI LATENT containing a 'samples' tensor.")
 
         image_latent = samples["samples"]
         if getattr(image_latent, "is_nested", False):
-            image_latent = image_latent.unbind()[0]
-        if image_latent.ndim not in (4, 5):
+            nested = image_latent.unbind()
+            if len(nested) != 1:
+                raise ValueError("Nested latent input must contain exactly one image latent.")
+            image_latent = nested[0]
+
+        # Some image workflows store a still image as [B,C,T,H,W] with T=1.
+        if image_latent.ndim == 5:
+            if image_latent.shape[2] != 1:
+                raise ValueError(
+                    "This bridge supports still images only. Expected a 5-D latent with T=1, "
+                    f"but received shape {tuple(image_latent.shape)}."
+                )
+            image_latent = image_latent[:, :, 0, :, :]
+        if image_latent.ndim != 4:
             raise ValueError(
-                "Expected a 4-D image latent [B,C,H,W] or a 5-D single-frame/video latent "
-                "[B,C,T,H,W], "
+                "Expected a 4-D image latent [B,C,H,W] or 5-D single-frame latent [B,C,1,H,W], "
                 f"but received shape {tuple(image_latent.shape)}."
-            )
-        if image_latent.ndim == 5 and image_latent.shape[2] != 1:
-            raise ValueError(
-                "This bridge accepts only a single image/frame, but the input latent has "
-                f"{image_latent.shape[2]} frames (shape {tuple(image_latent.shape)}). "
-                "Provide a single-frame latent."
             )
 
         factor = float(multiplier)
         if not 1.0 <= factor <= 4.0:
             raise ValueError(f"multiplier must be between 1.0 and 4.0, got {factor}.")
+        if int(short_side) < 0 or int(short_side) > 16384:
+            raise ValueError(f"short_side must be between 0 and 16384, got {short_side}.")
         if scaling_method not in self.SCALE_METHODS:
             raise ValueError(f"Unsupported scaling_method: {scaling_method}.")
 
-        # Decode the image latent to ComfyUI IMAGE [B,H,W,C].
-        # Pass through the latent's native rank: some image workflows use 4-D
-        # [B,C,H,W] latents, while SeedVR2-compatible workflows use 5-D
-        # [B,C,T,H,W] latents even when T=1.
         image = image_vae.decode(image_latent)
-        if image.ndim == 5:
-            # ComfyUI video IMAGE tensors are [B,T,H,W,C]; flatten batch and
-            # time into the image batch, preserving H/W/C.
-            image = image.reshape(-1, image.shape[-3], image.shape[-2], image.shape[-1])
         if image.ndim != 4 or image.shape[-1] < 3:
             raise ValueError(
                 "Image VAE did not return an IMAGE tensor in [B,H,W,C] layout; "
@@ -122,14 +147,12 @@ class SeedVR2ImageSpaceMultiplierBridge:
             )
         image = image[..., :3]
 
-        # The crucial fix: resize pixels BEFORE SeedVR2 VAE encoding.
-        # Align target dimensions to 8 pixels, matching the usual spatial VAE stride.
-        if factor != 1.0:
-            old_h, old_w = image.shape[1:3]
-            target_h = self._target_dimension(old_h, factor)
-            target_w = self._target_dimension(old_w, factor)
+        old_h, old_w = image.shape[1:3]
+        target_h, target_w = self._target_size(old_h, old_w, short_side, factor)
+        if (target_h, target_w) != (old_h, old_w):
             image = self._resize_image(image, target_h, target_w, scaling_method)
 
+        output_resolution = f"{target_w} × {target_h}"
         seedvr2_latent = seedvr2_vae.encode(image)
         if seedvr2_latent.ndim != 5:
             raise ValueError(
@@ -144,9 +167,10 @@ class SeedVR2ImageSpaceMultiplierBridge:
                 "Check the VAE connection and ComfyUI/SeedVR2 versions."
             )
 
-        # Do not rescale the encoded latent: its spatial size now follows the resized image.
-        return ({"samples": seedvr2_latent},)
+        return ({"samples": seedvr2_latent}, output_resolution)
 
+
+WEB_DIRECTORY = "./js"
 
 NODE_CLASS_MAPPINGS = {"SeedVR2ImageSpaceMultiplierBridge": SeedVR2ImageSpaceMultiplierBridge}
 NODE_DISPLAY_NAME_MAPPINGS = {
